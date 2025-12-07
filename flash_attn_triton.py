@@ -62,11 +62,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q, mask,  #
         k = desc_k.load([offsetk_y, 0]).T
         qk = tl.dot(q, k)
         if STAGE == 2:
-            # mask = mask[:, None] >= (start_n + offs_n[None, :])
-            print(f"mask: ", mask)
-            print(f"offs_n: ", offs_n)
-            # mask2d = mask >= (start_n + offs_n[None, :])
-            mask2d = 1
+            mask2d = mask[:, None] >= (start_n + offs_n[None, :])
             qk = qk * qk_scale + tl.where(mask2d, 0, -1.0e6)
             m_ij = tl.maximum(m_i, tl.max(qk, 1))
             qk -= m_ij[:, None]
@@ -172,7 +168,7 @@ def _maybe_make_tensor_desc(desc_or_ptr, shape, strides, block_shape):
                  prune_configs_by={'early_config_prune': prune_invalid_configs})
 @triton.jit
 def _attn_fwd(sm_scale, M,  #
-              Z, H, desc_q, desc_k, desc_v, desc_o, desc_mask, N_CTX, N_KV, #
+              Z, H, desc_q, desc_k, desc_v, desc_o, Mask, N_CTX, N_KV, #
               HEAD_DIM: tl.constexpr,  #
               BLOCK_M: tl.constexpr,  #
               BLOCK_N: tl.constexpr,  #
@@ -189,7 +185,6 @@ def _attn_fwd(sm_scale, M,  #
     off_h = off_hz % H
 
     y_dim = Z * H * N_CTX
-    mask_dim = Z * N_CTX
     yk_dim = Z * H * N_KV
     desc_q = _maybe_make_tensor_desc(desc_q, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1],
                                      block_shape=[BLOCK_M, HEAD_DIM])
@@ -204,13 +199,6 @@ def _attn_fwd(sm_scale, M,  #
                                      block_shape=[BLOCK_N, HEAD_DIM])
     desc_o = _maybe_make_tensor_desc(desc_o, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1],
                                      block_shape=[BLOCK_M, HEAD_DIM])
-
-    # desc_mask = _maybe_make_tensor_desc(
-    #     desc_mask,
-    #     shape=[Z, N_CTX],
-    #     strides=[N_CTX, 1],
-    #     block_shape=[BLOCK_M, 1]
-    # )
 
     offset_yk = off_z * (N_KV * H) + off_h * N_KV
     offset_y = off_z * (N_CTX * H) + off_h * N_CTX
@@ -229,9 +217,7 @@ def _attn_fwd(sm_scale, M,  #
     # load q: it will stay in SRAM throughout
     q = desc_q.load([qo_offset_y, 0])
 
-    # mask = desc_mask.load([offset_mask, 0])
-    mask = tl.full((1,), 1, tl.int64)
-    print("mask: ", mask)
+    mask = tl.load(Mask + offset_mask + tl.arange(0, BLOCK_M))
 
     # stage 1: off-band
     # For causal = True, STAGE = 3 and _attn_fwd_inner gets 1 as its STAGE
@@ -565,18 +551,11 @@ class _attention(torch.autograd.Function):
                 strides=[HEAD_DIM_K, 1],
                 block_shape=dummy_block
             )
-            desc_mask = TensorDescriptor(
-                mask,
-                shape=[mask.shape[0], mask.shape[1]],
-                strides=[mask.shape[1], 1],
-                block_shape=dummy_block
-            )
         else:
             desc_q = q
             desc_v = v
             desc_k = k
             desc_o = o
-            desc_mask = mask
 
         def alloc_fn(size: int, align: int, _):
             return torch.empty(size, dtype=torch.int8, device="cuda")
@@ -596,7 +575,7 @@ class _attention(torch.autograd.Function):
         _attn_fwd[grid](
             sm_scale, M,  #
             q.shape[0], q.shape[1],  #
-            desc_q, desc_k, desc_v, desc_o, desc_mask,  #
+            desc_q, desc_k, desc_v, desc_o, mask,  #
             N_CTX=q.shape[2], N_KV=k.shape[2],  #
             HEAD_DIM=HEAD_DIM_K,  #
             FP8_OUTPUT=q.dtype == torch.float8_e5m2,  #
