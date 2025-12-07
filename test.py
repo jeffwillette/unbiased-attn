@@ -105,7 +105,7 @@ def test_op(Z=32, H=32, N_CTX=8192, HEAD_DIM=128, causal=False, dtype=torch.floa
     # torch.testing.assert_close(tri_dq[:, :, mask], sparse_dq, atol=1e-2, rtol=rtol)
 
 
-def test_causal(Z=4, H=32, N_CTX=1024, HEAD_DIM=128, causal=True, dtype=torch.float16):
+def test_causal(Z=1, H=32, N_CTX=256 + 128, HEAD_DIM=128, causal=True, dtype=torch.float16):
     torch.manual_seed(20)
     q = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
     k = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
@@ -113,12 +113,11 @@ def test_causal(Z=4, H=32, N_CTX=1024, HEAD_DIM=128, causal=True, dtype=torch.fl
     sm_scale = 1 / np.sqrt(HEAD_DIM)
     # reference implementation
 
-    mask = torch.arange(N_CTX, device=q.device).view(1, N_CTX).repeat(Z, 1)
-    # mask = torch.randperm(N_CTX, device=q.device)[:256].sort().values.view(1, 256).repeat(Z, 1)
-    print("before tri")
-    tri_out = attention(q[:, :, mask], k, v, mask, causal, sm_scale).half()
+    # mask = torch.arange(N_CTX, device=q.device).view(1, N_CTX).repeat(Z, 1).contiguous()
+    mask = torch.randperm(N_CTX, device=q.device)[:256].sort().values.view(1, 256).repeat(Z, 1)
+    print(f"{q.size()=}")
+    tri_out = attention(q[:, :, mask[0]], k, v, mask, causal, sm_scale).half()
     dout = torch.randn_like(q)
-    print("after tri")
 
     # tri_out.backward(dout)
     # print(f"after backward: {q.grad=}")
@@ -136,7 +135,7 @@ def test_causal(Z=4, H=32, N_CTX=1024, HEAD_DIM=128, causal=True, dtype=torch.fl
     ref_out.backward(dout)
     print("after flash")
 
-    ref_out = ref_out[:, :, mask]
+    ref_out = ref_out[:, :, mask[0]]
 
     # print(f"after backward: {q.grad=}")
     ref_dv, v.grad = v.grad.clone(), None
@@ -144,6 +143,7 @@ def test_causal(Z=4, H=32, N_CTX=1024, HEAD_DIM=128, causal=True, dtype=torch.fl
     ref_dq, q.grad = q.grad.clone(), None
 
     rtol=0
+    print(f"{tri_out[0]=} {ref_out[0]=}")
     torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=rtol)
     # torch.testing.assert_close(tri_dv, ref_dv, atol=1e-2, rtol=rtol)
     # torch.testing.assert_close(tri_dk, ref_dk, atol=1e-2, rtol=rtol)
