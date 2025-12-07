@@ -113,10 +113,12 @@ def test_causal(Z=4, H=32, N_CTX=1024, HEAD_DIM=128, causal=True, dtype=torch.fl
     sm_scale = 1 / np.sqrt(HEAD_DIM)
     # reference implementation
 
-    # mask = torch.arange(N_CTX, device=q.device).view(1, N_CTX).repeat(Z, 1)
-    mask = torch.randperm(N_CTX, device=q.device)[:256].sort().values
+    mask = torch.arange(N_CTX, device=q.device).view(1, N_CTX).repeat(Z, 1)
+    # mask = torch.randperm(N_CTX, device=q.device)[:256].sort().values.view(1, 256).repeat(Z, 1)
+    print("before tri")
     tri_out = attention(q[:, :, mask], k, v, mask, causal, sm_scale).half()
     dout = torch.randn_like(q)
+    print("after tri")
 
     # tri_out.backward(dout)
     # print(f"after backward: {q.grad=}")
@@ -132,6 +134,7 @@ def test_causal(Z=4, H=32, N_CTX=1024, HEAD_DIM=128, causal=True, dtype=torch.fl
         causal=causal
     ).transpose(1, 2)
     ref_out.backward(dout)
+    print("after flash")
 
     ref_out = ref_out[:, :, mask]
 
