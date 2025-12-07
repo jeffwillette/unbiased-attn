@@ -114,7 +114,7 @@ def test_causal(Z=4, H=32, N_CTX=1024, HEAD_DIM=128, causal=True, dtype=torch.fl
     # reference implementation
 
     # mask = torch.arange(N_CTX, device=q.device).view(1, N_CTX).repeat(Z, 1)
-    mask = torch.randperm(N_CTX, device=q.device)[:256]
+    mask = torch.randperm(N_CTX, device=q.device)[:256].sort().values
     tri_out = attention(q[:, :, mask], k, v, mask, causal, sm_scale).half()
     dout = torch.randn_like(q)
 

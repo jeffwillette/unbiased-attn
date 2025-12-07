@@ -202,7 +202,7 @@ def _attn_fwd(sm_scale, M,  #
 
     offset_yk = off_z * (N_KV * H) + off_h * N_KV
     offset_y = off_z * (N_CTX * H) + off_h * N_CTX
-    offset_mask = off_z * N_CTX + start_m * BLOCK_M
+    offset_mask = off_z * N_CTX
     qo_offset_y = offset_y + start_m * BLOCK_M
     # initialize offsets
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -217,7 +217,7 @@ def _attn_fwd(sm_scale, M,  #
     # load q: it will stay in SRAM throughout
     q = desc_q.load([qo_offset_y, 0])
 
-    mask = tl.load(Mask + offset_mask + tl.arange(0, BLOCK_M))
+    mask = tl.load(Mask + offset_mask + offs_m, mask=offs_m < N_CTX, other=N_KV)
 
     # stage 1: off-band
     # For causal = True, STAGE = 3 and _attn_fwd_inner gets 1 as its STAGE
