@@ -105,7 +105,7 @@ def test_op(Z=32, H=32, N_CTX=8192, HEAD_DIM=128, causal=False, dtype=torch.floa
     # torch.testing.assert_close(tri_dq[:, :, mask], sparse_dq, atol=1e-2, rtol=rtol)
 
 
-def test_causal(Z=1, H=32, N_CTX=256 + 128, HEAD_DIM=128, causal=True, dtype=torch.float16):
+def test_causal(Z=4, H=32, N_CTX=1024, HEAD_DIM=128, causal=True, dtype=torch.float16):
     torch.manual_seed(20)
     q = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
     k = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
@@ -113,17 +113,16 @@ def test_causal(Z=1, H=32, N_CTX=256 + 128, HEAD_DIM=128, causal=True, dtype=tor
     sm_scale = 1 / np.sqrt(HEAD_DIM)
     # reference implementation
 
-    # mask = torch.arange(N_CTX, device=q.device).view(1, N_CTX).repeat(Z, 1).contiguous()
-    mask = torch.randperm(N_CTX, device=q.device)[:256].sort().values.view(1, 256).repeat(Z, 1)
-    print(f"{q.size()=}")
-    tri_out = attention(q[:, :, mask[0]], k, v, mask, causal, sm_scale).half()
+    mask = torch.arange(N_CTX, device=q.device).view(1, N_CTX).repeat(Z, 1).contiguous()
+    # mask = torch.randperm(N_CTX, device=q.device)[:256].sort().values.view(1, 256).repeat(Z, 1)
+    q_subset = q[:, :, mask[0]].detach().clone().requires_grad_()
+    tri_out = attention(q_subset, k, v, mask, causal, sm_scale).half()
     dout = torch.randn_like(q)
 
-    # tri_out.backward(dout)
-    # print(f"after backward: {q.grad=}")
-    # tri_dv, v.grad = v.grad.clone(), None
-    # tri_dk, k.grad = k.grad.clone(), None
-    # tri_dq, q.grad = q.grad.clone(), None
+    tri_out.backward(dout[:, :, mask[0]])
+    tri_dv, v.grad = v.grad.clone(), None
+    tri_dk, k.grad = k.grad.clone(), None
+    tri_dq, q_subset.grad = q_subset.grad.clone(), None
 
     ref_out = flash_attn_func(
         q.transpose(1, 2),
@@ -133,7 +132,6 @@ def test_causal(Z=1, H=32, N_CTX=256 + 128, HEAD_DIM=128, causal=True, dtype=tor
         causal=causal
     ).transpose(1, 2)
     ref_out.backward(dout)
-    print("after flash")
 
     ref_out = ref_out[:, :, mask[0]]
 
@@ -143,14 +141,19 @@ def test_causal(Z=1, H=32, N_CTX=256 + 128, HEAD_DIM=128, causal=True, dtype=tor
     ref_dq, q.grad = q.grad.clone(), None
 
     rtol=0
-    head = 24
-    print(f"{tri_out[0, head, :, 0]=} {ref_out[0, head, :, 0]=}")
-    print(f"{(tri_out[0, head, :, 0] -ref_out[0, head, :, 0]).abs()=}")
+    # head = 22
+    # print(f"{tri_out[0, head, :, 0]=} {ref_out[0, head, :, 0]=}")
+    # print(f"{(tri_out[0, head, :, 0] -ref_out[0, head, :, 0]).abs()=}")
     torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=rtol)
+    print("tri out equals ref out. OK!")
     # torch.testing.assert_close(tri_dv, ref_dv, atol=1e-2, rtol=rtol)
     # torch.testing.assert_close(tri_dk, ref_dk, atol=1e-2, rtol=rtol)
-    # torch.testing.assert_close(tri_dq, ref_dq, atol=1e-2, rtol=rtol)
-    print("tri backward equals ref. OK!")
+    print(f"{tri_dq=} {ref_dq=}")
+    print(f"{tri_dq.size()=} {ref_dq.size()=}")
+    torch.set_printoptions(threshold=10000)
+    print(f"diffs: {(tri_dq[0, 0, :, 0] - ref_dq[0, 0, :, 0]).abs()}")
+    torch.testing.assert_close(tri_dq, ref_dq[:, :, mask[0]], atol=1e-2, rtol=rtol)
+    print("tri dq equals ref. OK!")
     exit("exiting early")
 
     sp_dv, sp_dk = torch.zeros_like(v), torch.zeros_like(k)

@@ -41,10 +41,13 @@ def _attn_fwd_inner(acc, l_i, m_i, q, mask,  #
     if STAGE == 1:
         start_mask = tl.cdiv(tl.min(mask).to(tl.int32) - BLOCK_N, BLOCK_N)
         lo, hi = 0, start_mask * BLOCK_N
+        hi = tl.minimum(tl.maximum(hi, 0), N_KV)
     elif STAGE == 2:
         start_mask = tl.cdiv(tl.min(mask).to(tl.int32) - BLOCK_N, BLOCK_N)
         end_mask = tl.cdiv(tl.max(mask).to(tl.int32), BLOCK_N)
-        lo, hi = start_mask * BLOCK_N, (end_mask + 1) * BLOCK_N
+        lo, hi = start_mask * BLOCK_N, (end_mask) * BLOCK_N
+        lo = tl.maximum(lo, 0)
+        hi = tl.minimum(hi, N_KV)
         lo = tl.multiple_of(lo, BLOCK_N)
     # causal = False
     else:
@@ -184,26 +187,26 @@ def _attn_fwd(sm_scale, M,  #
     off_z = off_hz // H
     off_h = off_hz % H
 
-    y_dim = Z * H * N_CTX
-    yk_dim = Z * H * N_KV
-    desc_q = _maybe_make_tensor_desc(desc_q, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1],
+    q_dim = Z * H * N_CTX
+    k_dim = Z * H * N_KV
+    desc_q = _maybe_make_tensor_desc(desc_q, shape=[q_dim, HEAD_DIM], strides=[HEAD_DIM, 1],
                                      block_shape=[BLOCK_M, HEAD_DIM])
     if FP8_OUTPUT:
-        desc_v = _maybe_make_tensor_desc(desc_v, shape=[HEAD_DIM, yk_dim], strides=[N_KV, 1],
+        desc_v = _maybe_make_tensor_desc(desc_v, shape=[HEAD_DIM, k_dim], strides=[N_KV, 1],
                                          block_shape=[HEAD_DIM, BLOCK_N])
     else:
-        desc_v = _maybe_make_tensor_desc(desc_v, shape=[yk_dim, HEAD_DIM], strides=[HEAD_DIM, 1],
+        desc_v = _maybe_make_tensor_desc(desc_v, shape=[k_dim, HEAD_DIM], strides=[HEAD_DIM, 1],
                                          block_shape=[BLOCK_N, HEAD_DIM])
 
-    desc_k = _maybe_make_tensor_desc(desc_k, shape=[yk_dim, HEAD_DIM], strides=[HEAD_DIM, 1],
+    desc_k = _maybe_make_tensor_desc(desc_k, shape=[k_dim, HEAD_DIM], strides=[HEAD_DIM, 1],
                                      block_shape=[BLOCK_N, HEAD_DIM])
-    desc_o = _maybe_make_tensor_desc(desc_o, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1],
+    desc_o = _maybe_make_tensor_desc(desc_o, shape=[q_dim, HEAD_DIM], strides=[HEAD_DIM, 1],
                                      block_shape=[BLOCK_M, HEAD_DIM])
 
-    offset_yk = off_z * (N_KV * H) + off_h * N_KV
-    offset_y = off_z * (N_CTX * H) + off_h * N_CTX
+    offset_k = off_z * (N_KV * H) + off_h * N_KV
+    offset_q = off_z * (N_CTX * H) + off_h * N_CTX
     offset_mask = off_z * N_CTX
-    qo_offset_y = offset_y + start_m * BLOCK_M
+    qo_offset = offset_q + start_m * BLOCK_M
     # initialize offsets
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
@@ -215,7 +218,7 @@ def _attn_fwd(sm_scale, M,  #
     qk_scale = sm_scale
     qk_scale *= 1.44269504  # 1/log(2)
     # load q: it will stay in SRAM throughout
-    q = desc_q.load([qo_offset_y, 0])
+    q = desc_q.load([qo_offset, 0])
 
     mask = tl.load(Mask + offset_mask + offs_m, mask=offs_m < N_CTX, other=N_KV)
 
@@ -225,7 +228,7 @@ def _attn_fwd(sm_scale, M,  #
     if STAGE & 1:
         acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, mask,   #
                                         desc_k, desc_v,  #
-                                        offset_y, offset_yk, dtype, start_m, qk_scale,  #
+                                        offset_q, offset_k, dtype, start_m, qk_scale,  #
                                         BLOCK_M, HEAD_DIM, BLOCK_N,  #
                                         4 - STAGE, offs_m, offs_n, N_CTX, N_KV,  #
                                         warp_specialize, IS_HOPPER)
@@ -233,7 +236,7 @@ def _attn_fwd(sm_scale, M,  #
     if STAGE & 2:
         acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, mask,  #
                                         desc_k, desc_v,  #
-                                        offset_y, offset_yk, dtype, start_m, qk_scale,  #
+                                        offset_q, offset_k, dtype, start_m, qk_scale,  #
                                         BLOCK_M, HEAD_DIM, BLOCK_N,  #
                                         2, offs_m, offs_n, N_CTX, N_KV,  #
                                         warp_specialize, IS_HOPPER)
@@ -242,7 +245,7 @@ def _attn_fwd(sm_scale, M,  #
     acc = acc / l_i[:, None]
     m_ptrs = M + off_hz * N_CTX + offs_m
     tl.store(m_ptrs, m_i)
-    desc_o.store([qo_offset_y, 0], acc.to(dtype))
+    desc_o.store([qo_offset, 0], acc.to(dtype))
 
 
 @triton.jit
@@ -324,12 +327,14 @@ def _attn_bwd_dq(dq, q, K, V,  #
                  # shared by Q/K/V/DO.
                  stride_ktok, stride_kd,  #
                  H, N_CTX, N_KV,  #
+                 mask,
                  BLOCK_M2: tl.constexpr,  #
                  BLOCK_N2: tl.constexpr,  #
                  HEAD_DIM: tl.constexpr,
                  # Filled in by the wrapper.
                  start_m, start_n, num_steps,  #
                  MASK: tl.constexpr):
+
     offs_m = start_m + tl.arange(0, BLOCK_M2)
     offs_n = start_n + tl.arange(0, BLOCK_N2)
     offs_k = tl.arange(0, HEAD_DIM)
@@ -341,16 +346,18 @@ def _attn_bwd_dq(dq, q, K, V,  #
     tl.static_assert(BLOCK_M2 % BLOCK_N2 == 0)
     curr_n = start_n
     step_n = BLOCK_N2
+    # print("curr n: ", curr_n)
+    # print("num steps: ", num_steps)
     for blk_idx in range(num_steps):
-        kT = tl.load(kT_ptrs)
-        vT = tl.load(vT_ptrs)
+        kT = tl.load(kT_ptrs, mask=offs_n[None, :] < N_KV, other=0)
+        vT = tl.load(vT_ptrs, mask=offs_n[None, :] < N_KV, other=0)
         qk = tl.dot(q, kT)
         p = tl.math.exp2(qk - m)
         # Autoregressive masking.
         if MASK:
             offs_n = curr_n + tl.arange(0, BLOCK_N2)
-            mask = (offs_m[:, None] >= offs_n[None, :])
-            p = tl.where(mask, p, 0.0)
+            mask2d = (mask[:, None] >= offs_n[None, :])
+            p = tl.where(mask2d, p, 0.0)
         # Compute dP and dS.
         dp = tl.dot(do, vT).to(tl.float32)
         ds = p * (dp - Di[:, None])
@@ -382,12 +389,14 @@ def _attn_bwd(Q, K, V, sm_scale,  #
               BLK_SLICE_FACTOR: tl.constexpr,  #
               HEAD_DIM: tl.constexpr,  #
               CAUSAL: tl.constexpr):
+
     LN2: tl.constexpr = 0.6931471824645996  # = ln(2)
 
     bhid = tl.program_id(2)
     off_chz = (bhid * N_CTX).to(tl.int64)
     qadj = (stride_qh * (bhid % H) + stride_qz * (bhid // H)).to(tl.int64)
     kadj = (stride_kh * (bhid % H) + stride_kz * (bhid // H)).to(tl.int64)
+    madj = (bhid // H) * N_CTX
     pid = tl.program_id(0)
 
     # offset pointers for batch/head
@@ -400,6 +409,7 @@ def _attn_bwd(Q, K, V, sm_scale,  #
     DV += kadj
     M += off_chz
     D += off_chz
+    Mask += madj
 
     # load scales
     offs_k = tl.arange(0, HEAD_DIM)
@@ -417,45 +427,52 @@ def _attn_bwd(Q, K, V, sm_scale,  #
     k = tl.load(K + offs_n[:, None] * stride_ktok + offs_k[None, :] * stride_kd)
     v = tl.load(V + offs_n[:, None] * stride_ktok + offs_k[None, :] * stride_kd)
 
-    if CAUSAL:
-        start_m = start_n
-        num_steps = BLOCK_N1 // MASK_BLOCK_M1
-        dk, dv = _attn_bwd_dkdv(dk, dv,  #
-                                Q, k, v, sm_scale,  #
-                                DO,  #
-                                M, D,  #
-                                stride_qtok, stride_qd,  #
-                                H, N_CTX, N_KV, #
-                                MASK_BLOCK_M1, BLOCK_N1, HEAD_DIM,  #
-                                start_n, start_m, num_steps,  #
-                                MASK=True,  #
-                                )
+    # TODO: 
+    #  - Mask is not part of the dkdv args
+    #  - we are going to have to figure out how masking works vertically here. 
 
-        start_m += num_steps * MASK_BLOCK_M1
+    # if CAUSAL:
+    #     start_m = start_n
+    #     num_steps = BLOCK_N1 // MASK_BLOCK_M1
+    #     dk, dv = _attn_bwd_dkdv(dk, dv,  #
+    #                             Q, k, v, sm_scale,  #
+    #                             DO,  #
+    #                             M, D,  #
+    #                             Mask,
+    #                             stride_qtok, stride_qd,  #
+    #                             H, N_CTX, N_KV, #
+    #                             MASK_BLOCK_M1, BLOCK_N1, HEAD_DIM,  #
+    #                             start_n, start_m, num_steps,  #
+    #                             MASK=True,  #
+    #                             )
 
-    # Compute dK and dV for non-masked blocks.
-    num_steps = (N_CTX - start_m) // BLOCK_M1
-    dk, dv = _attn_bwd_dkdv(  #
-        dk, dv,  #
-        Q, k, v, sm_scale,  #
-        DO,  #
-        M, D,  #
-        stride_qtok, stride_qd,  #
-        H, N_CTX, N_KV,  #
-        BLOCK_M1, BLOCK_N1, HEAD_DIM,  #
-        start_n, start_m, num_steps,  #
-        MASK=False,  #
-    )
+    #     start_m += num_steps * MASK_BLOCK_M1
 
-    dv_ptrs = DV + offs_n[:, None] * stride_ktok + offs_k[None, :] * stride_kd
-    tl.store(dv_ptrs, dv)
+    # # Compute dK and dV for non-masked blocks.
+    # num_steps = (N_CTX - start_m) // BLOCK_M1
+    # dk, dv = _attn_bwd_dkdv(  #
+    #     dk, dv,  #
+    #     Q, k, v, sm_scale,  #
+    #     DO,  #
+    #     M, D,  #
+    #     Mask,
+    #     stride_qtok, stride_qd,  #
+    #     H, N_CTX, N_KV,  #
+    #     BLOCK_M1, BLOCK_N1, HEAD_DIM,  #
+    #     start_n, start_m, num_steps,  #
+    #     MASK=False,  #
+    # )
 
-    # Write back dK.
-    dk *= sm_scale
-    dk_ptrs = DK + offs_n[:, None] * stride_ktok + offs_k[None, :] * stride_kd
-    tl.store(dk_ptrs, dk)
+    # dv_ptrs = DV + offs_n[:, None] * stride_ktok + offs_k[None, :] * stride_kd
+    # tl.store(dv_ptrs, dv)
+
+    # # Write back dK.
+    # dk *= sm_scale
+    # dk_ptrs = DK + offs_n[:, None] * stride_ktok + offs_k[None, :] * stride_kd
+    # tl.store(dk_ptrs, dk)
 
     # THIS BLOCK DOES DQ:
+    # M1 == N2 (32), N1 == M2 (128)
     start_m = pid * BLOCK_M2
     if start_m < N_CTX:
         start_n = 0
@@ -477,17 +494,28 @@ def _attn_bwd(Q, K, V, sm_scale,  #
             # but inside each call to _attn_bwd_dq, from left to right), but that's
             # not due to anything important.  I just wanted to reuse the loop
             # structure for dK & dV above as much as possible.
-            end_n = start_m + BLOCK_M2
-            num_steps = BLOCK_M2 // MASK_BLOCK_N2
+
+            mask = tl.load(Mask + offs_m, mask=offs_m < N_CTX, other=N_KV)
+            end_n = tl.cdiv(tl.max(mask).to(tl.int32), BLOCK_N2) * BLOCK_N2
+
+            # TODO: delete if this works
+            # end_n = start_m + BLOCK_M2
+            # num_steps = BLOCK_M2 // MASK_BLOCK_N2
+
+            num_steps = tl.cdiv(tl.max(mask).to(tl.int32), BLOCK_N2) \
+                - tl.cdiv(tl.min(mask).to(tl.int32), BLOCK_N2)
+
             dq = _attn_bwd_dq(dq, q, K, V,  #
                               do, m, D,  #
                               stride_ktok, stride_kd,  #
                               H, N_CTX, N_KV,  #
+                              mask,
                               BLOCK_M2, MASK_BLOCK_N2, HEAD_DIM,  #
-                              start_m, end_n - num_steps * MASK_BLOCK_N2, num_steps,  #
+                              start_m, end_n - num_steps * BLOCK_N2, num_steps,  #
                               MASK=True,  #
                               )
-            end_n -= num_steps * MASK_BLOCK_N2
+
+            end_n -= num_steps * BLOCK_N2
             # stage 2
             num_steps = end_n // BLOCK_N2
             start_n = end_n - num_steps * BLOCK_N2
@@ -496,6 +524,7 @@ def _attn_bwd(Q, K, V, sm_scale,  #
                           do, m, D,  #
                           stride_ktok, stride_kd,  #
                           H, N_CTX, N_KV,  #
+                          mask,
                           BLOCK_M2, BLOCK_N2, HEAD_DIM,  #
                           start_m, start_n, num_steps,  #
                           MASK=False,  #
@@ -534,20 +563,22 @@ class _attention(torch.autograd.Function):
         # Use device_descriptor for Hopper + warpspec.
         if supports_host_descriptor() and not (is_hopper() and warp_specialize):
             # Note that on Hopper we cannot perform a FP8 dot with a non-transposed second tensor
-            y_dim = q.shape[0] * q.shape[1] * q.shape[2]
+            q_dim = q.shape[0] * q.shape[1] * q.shape[2]
+            k_dim = k.shape[0] * k.shape[1] * k.shape[2]
+
 
             dummy_block = [1, 1]
-            desc_q = TensorDescriptor(q, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
+            desc_q = TensorDescriptor(q, shape=[q_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
             if q.dtype == torch.float8_e5m2:
-                desc_v = TensorDescriptor(v, shape=[HEAD_DIM_K, y_dim], strides=[q.shape[2], 1],
+                desc_v = TensorDescriptor(v, shape=[HEAD_DIM_K, k_dim], strides=[q.shape[2], 1],
                                           block_shape=dummy_block)
             else:
-                desc_v = TensorDescriptor(v, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1],
+                desc_v = TensorDescriptor(v, shape=[k_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1],
                                           block_shape=dummy_block)
-            desc_k = TensorDescriptor(k, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
+            desc_k = TensorDescriptor(k, shape=[k_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
             desc_o = TensorDescriptor(
                 o,
-                shape=[y_dim, HEAD_DIM_K], 
+                shape=[k_dim, HEAD_DIM_K], 
                 strides=[HEAD_DIM_K, 1],
                 block_shape=dummy_block
             )
@@ -619,11 +650,13 @@ class _attention(torch.autograd.Function):
             BATCH, N_HEAD, N_CTX, N_KV,  #
             BLOCK_M=PRE_BLOCK, HEAD_DIM=ctx.HEAD_DIM  #
         )
+
         # grid = (N_CTX // BLOCK_N1, 1, BATCH * N_HEAD)
         grid = (triton.cdiv(N_KV, BLOCK_N1), 1, BATCH * N_HEAD)
         _attn_bwd[grid](
             q, arg_k, v, ctx.sm_scale, do, dq, dk, dv,  #
             M, delta,  #
+            mask,
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),  #
             k.stride(0), k.stride(1), k.stride(2), k.stride(3),  #
             N_HEAD, N_CTX, N_KV,  #
@@ -636,6 +669,7 @@ class _attention(torch.autograd.Function):
             CAUSAL=ctx.causal,  #
         )
 
+        print(f"before reutrn: ", dq.size())
         return dq, dk, dv, None, None, None, None
 
 
