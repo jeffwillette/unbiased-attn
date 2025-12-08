@@ -143,7 +143,9 @@ def test_causal(Z=1, H=32, N_CTX=256 + 128, HEAD_DIM=128, causal=True, dtype=tor
     ref_dq, q.grad = q.grad.clone(), None
 
     rtol=0
-    print(f"{tri_out[0]=} {ref_out[0]=}")
+    head = 24
+    print(f"{tri_out[0, head, :, 0]=} {ref_out[0, head, :, 0]=}")
+    print(f"{(tri_out[0, head, :, 0] -ref_out[0, head, :, 0]).abs()=}")
     torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=rtol)
     # torch.testing.assert_close(tri_dv, ref_dv, atol=1e-2, rtol=rtol)
     # torch.testing.assert_close(tri_dk, ref_dk, atol=1e-2, rtol=rtol)

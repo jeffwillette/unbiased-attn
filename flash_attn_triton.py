@@ -39,13 +39,13 @@ def _attn_fwd_inner(acc, l_i, m_i, q, mask,  #
 
     # range of values handled by this stage
     if STAGE == 1:
-        start_mask = tl.cdiv(tl.min(mask).to(tl.int32) - BLOCK_M, BLOCK_M)
-        lo, hi = 0, start_mask * BLOCK_M
+        start_mask = tl.cdiv(tl.min(mask).to(tl.int32) - BLOCK_N, BLOCK_N)
+        lo, hi = 0, start_mask * BLOCK_N
     elif STAGE == 2:
-        start_mask = tl.cdiv(tl.min(mask).to(tl.int32) - BLOCK_M, BLOCK_M)
-        end_mask = tl.cdiv(tl.max(mask).to(tl.int32), BLOCK_M)
-        lo, hi = start_mask * BLOCK_M, (end_mask + 1) * BLOCK_M
-        lo = tl.multiple_of(lo, BLOCK_M)
+        start_mask = tl.cdiv(tl.min(mask).to(tl.int32) - BLOCK_N, BLOCK_N)
+        end_mask = tl.cdiv(tl.max(mask).to(tl.int32), BLOCK_N)
+        lo, hi = start_mask * BLOCK_N, (end_mask + 1) * BLOCK_N
+        lo = tl.multiple_of(lo, BLOCK_N)
     # causal = False
     else:
         lo, hi = 0, N_KV
